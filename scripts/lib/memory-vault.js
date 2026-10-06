@@ -50,8 +50,10 @@ function findNearestProjectRoot(cwd) {
         stdio: 'ignore',
         timeout: 5000,
       });
-      if (result.error) {
-        throw new Error('Unable to validate Git project root.', { cause: result.error });
+      if (result.error || result.signal || result.status === null) {
+        throw new Error('Unable to validate Git project root.', {
+          cause: result.error || { signal: result.signal, status: result.status },
+        });
       }
       if (result.status === 0) {
         return current;

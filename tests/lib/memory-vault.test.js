@@ -4,6 +4,8 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const vm = require('vm');
+const { createRequire } = require('module');
 const { spawnSync } = require('child_process');
 
 const {
@@ -207,6 +209,62 @@ test('refuses to select a different memory root when Git is unavailable', () => 
     assert.strictEqual(result.status, 0, result.stderr);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+function mockGitValidation(result) {
+  const filename = require.resolve('../../scripts/lib/memory-vault');
+  const localRequire = createRequire(filename);
+  let calls = 0;
+  const sandbox = {
+    module: { exports: {} },
+    require: name => {
+      if (name === 'fs') return { ...fs, existsSync: () => true };
+      if (name === 'child_process') {
+        return { spawnSync: () => (++calls === 1 ? result : { status: 0 }) };
+      }
+      return localRequire(name);
+    },
+    process,
+    Buffer,
+  };
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename });
+  return { core: sandbox.module.exports, calls: () => calls };
+}
+
+const gitValidationFailures = [
+  ['timeout ETIMEDOUT', { error: Object.assign(new Error('Git timed out'), { code: 'ETIMEDOUT' }), status: null, signal: 'SIGTERM' }],
+  ['termination by signal', { status: null, signal: 'SIGTERM' }],
+  ['null status without a signal', { status: null, signal: null }],
+];
+
+for (const [name, result] of gitValidationFailures) {
+  test(`rejects Git ${name} without selecting another candidate root`, () => {
+    const mocked = mockGitValidation(result);
+    assert.throws(() => mocked.core.findNearestProjectRoot(path.join(os.tmpdir(), 'project', 'nested')), error => {
+      assert.match(error.message, /Unable to validate Git project root/);
+      if (result.error) assert.strictEqual(error.cause, result.error);
+      else {
+        assert.strictEqual(error.cause.signal, result.signal);
+        assert.strictEqual(error.cause.status, result.status);
+      }
+      return true;
+    });
+    // Every ancestor is a candidate and the next validation would succeed.
+    assert.strictEqual(mocked.calls(), 1);
+  });
+}
+
+test('explicit project root bypasses Git validation for every interruption result', () => {
+  for (const [, result] of gitValidationFailures) {
+    const mocked = mockGitValidation(result);
+    const projectVault = path.join(os.tmpdir(), 'explicit-memory');
+    const roots = mocked.core.resolveVaultRoots({
+      cwd: os.tmpdir(), env: { ECC_MEMORY_PROJECT_ROOT: projectVault },
+    });
+    assert.strictEqual(roots.project, path.join(projectVault, 'project'));
+    assert.strictEqual(roots.team, path.join(projectVault, 'team'));
+    assert.strictEqual(mocked.calls(), 0);
   }
 });
 
