@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const { assertWithinTrustedRoot, realpathNearestExisting } = require('./path-safety');
 const {
@@ -41,8 +42,22 @@ const VAULT_ROOT_BOUNDARIES = Symbol('vaultRootBoundaries');
 function findNearestProjectRoot(cwd) {
   let current = path.resolve(cwd);
   while (true) {
-    if (fs.existsSync(path.join(current, '.git'))) {
-      return current;
+    const gitEntry = path.join(current, '.git');
+    if (fs.existsSync(gitEntry)) {
+      // Git validates directories and worktree gitfiles; existence alone also
+      // accepts empty sandbox placeholders and unrelated files.
+      const result = spawnSync('git', ['rev-parse', '--resolve-git-dir', gitEntry], {
+        stdio: 'ignore',
+        timeout: 5000,
+      });
+      if (result.error || result.signal || result.status === null) {
+        throw new Error('Unable to validate Git project root.', {
+          cause: result.error || { signal: result.signal, status: result.status },
+        });
+      }
+      if (result.status === 0) {
+        return current;
+      }
     }
     const parent = path.dirname(current);
     if (parent === current) {
@@ -62,7 +77,7 @@ function resolveVaultRoots(options = {}) {
   const homeDir = path.resolve(
     options.homeDir || env.HOME || env.USERPROFILE || os.homedir()
   );
-  const projectRoot = findNearestProjectRoot(cwd);
+  const projectRoot = env.ECC_MEMORY_PROJECT_ROOT ? null : findNearestProjectRoot(cwd);
   const projectVault = env.ECC_MEMORY_PROJECT_ROOT
     ? resolveOverride(env.ECC_MEMORY_PROJECT_ROOT, cwd)
     : path.join(projectRoot, '.ecc', 'memory');

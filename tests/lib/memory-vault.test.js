@@ -4,6 +4,8 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const vm = require('vm');
+const { createRequire } = require('module');
 const { spawnSync } = require('child_process');
 
 const {
@@ -45,9 +47,10 @@ function createFixture() {
   const projectRoot = path.join(root, 'project');
   const nested = path.join(projectRoot, 'packages', 'app');
   const homeDir = path.join(root, 'home');
-  fs.mkdirSync(path.join(projectRoot, '.git'), { recursive: true });
   fs.mkdirSync(nested, { recursive: true });
   fs.mkdirSync(homeDir, { recursive: true });
+  const initialized = spawnSync('git', ['init', '-q', projectRoot], { encoding: 'utf8' });
+  assert.strictEqual(initialized.status, 0, initialized.stderr);
   const roots = resolveVaultRoots({ cwd: nested, homeDir, env: {} });
   return { root, projectRoot, nested, homeDir, roots };
 }
@@ -112,6 +115,156 @@ test('uses the working directory for non-git projects instead of a global bucket
     assert.strictEqual(roots.team, path.join(root, '.ecc', 'memory', 'team'));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('ignores an empty .git directory inside a real project', () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.join(fixture.nested, '.git'));
+    const roots = resolveVaultRoots({ cwd: fixture.nested, homeDir: fixture.homeDir, env: {} });
+    assert.strictEqual(roots.project, fixture.roots.project);
+    assert.strictEqual(roots.team, fixture.roots.team);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('ignores a malformed .git file inside a real project', () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.nested, '.git'), 'not a git directory reference\n');
+    const roots = resolveVaultRoots({ cwd: fixture.nested, homeDir: fixture.homeDir, env: {} });
+    assert.strictEqual(roots.project, fixture.roots.project);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('recognizes a valid .git file with a relative gitdir path', () => {
+  const fixture = createFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.nested, '.git'), 'gitdir: ../../.git\n');
+    const roots = resolveVaultRoots({ cwd: fixture.nested, homeDir: fixture.homeDir, env: {} });
+    assert.strictEqual(roots.project, path.join(fixture.nested, '.ecc', 'memory', 'project'));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('recognizes a real linked worktree with a gitfile and commondir', () => {
+  const fixture = createFixture();
+  try {
+    const runGit = args => {
+      const result = spawnSync('git', ['-C', fixture.projectRoot, ...args], {
+        encoding: 'utf8',
+        env: { ...process.env, GIT_AUTHOR_NAME: 'ECC Test', GIT_AUTHOR_EMAIL: 'test@example.test',
+          GIT_COMMITTER_NAME: 'ECC Test', GIT_COMMITTER_EMAIL: 'test@example.test' },
+      });
+      assert.strictEqual(result.status, 0, result.stderr);
+      return result.stdout.trim();
+    };
+    const tree = runGit(['write-tree']);
+    const commit = runGit(['commit-tree', tree, '-m', 'Linked worktree test fixture']);
+    const worktree = path.join(fixture.root, 'linked-worktree');
+    runGit(['worktree', 'add', '--detach', '--no-checkout', worktree, commit]);
+    const gitfile = path.join(worktree, '.git');
+    assert.ok(fs.statSync(gitfile).isFile());
+    const reference = fs.readFileSync(gitfile, 'utf8').trim();
+    assert.ok(reference.startsWith('gitdir: '));
+    const gitdir = path.resolve(worktree, reference.slice('gitdir: '.length));
+    const commondir = fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim();
+    assert.strictEqual(path.resolve(gitdir, commondir), path.join(fixture.projectRoot, '.git'));
+    const nested = path.join(worktree, 'packages', 'app');
+    fs.mkdirSync(nested, { recursive: true });
+    const roots = resolveVaultRoots({ cwd: nested, homeDir: fixture.homeDir, env: {} });
+    assert.strictEqual(roots.project, path.join(worktree, '.ecc', 'memory', 'project'));
+    assert.strictEqual(roots.team, path.join(worktree, '.ecc', 'memory', 'team'));
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test('refuses to select a different memory root when Git is unavailable', () => {
+  const fixture = createFixture();
+  try {
+    const script = `
+      const assert = require('assert');
+      const { resolveVaultRoots } = require(process.argv[1]);
+      assert.throws(() => resolveVaultRoots({ cwd: process.cwd(), env: {} }), /Unable to validate Git/);
+      const path = require('path');
+      const projectVault = path.join(process.cwd(), 'explicit-memory');
+      const roots = resolveVaultRoots({ cwd: process.cwd(), env: {
+        ECC_MEMORY_PROJECT_ROOT: projectVault,
+      } });
+      assert.strictEqual(roots.project, path.join(projectVault, 'project'));
+      assert.strictEqual(roots.team, path.join(projectVault, 'team'));
+    `;
+    const result = spawnSync(process.execPath, ['-e', script, require.resolve('../../scripts/lib/memory-vault')], {
+      cwd: fixture.nested,
+      env: { ...process.env, PATH: fixture.homeDir },
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    assert.strictEqual(result.status, 0, result.stderr);
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+function mockGitValidation(result) {
+  const filename = require.resolve('../../scripts/lib/memory-vault');
+  const localRequire = createRequire(filename);
+  let calls = 0;
+  const sandbox = {
+    module: { exports: {} },
+    require: name => {
+      if (name === 'fs') return { ...fs, existsSync: () => true };
+      if (name === 'child_process') {
+        return { spawnSync: () => (++calls === 1 ? result : { status: 0 }) };
+      }
+      return localRequire(name);
+    },
+    process,
+    Buffer,
+  };
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), sandbox, { filename });
+  return { core: sandbox.module.exports, calls: () => calls };
+}
+
+const gitValidationFailures = [
+  ['timeout ETIMEDOUT', { error: Object.assign(new Error('Git timed out'), { code: 'ETIMEDOUT' }), status: null, signal: 'SIGTERM' }],
+  ['termination by signal', { status: null, signal: 'SIGTERM' }],
+  ['null status without a signal', { status: null, signal: null }],
+];
+
+for (const [name, result] of gitValidationFailures) {
+  test(`rejects Git ${name} without selecting another candidate root`, () => {
+    const mocked = mockGitValidation(result);
+    assert.throws(() => mocked.core.findNearestProjectRoot(path.join(os.tmpdir(), 'project', 'nested')), error => {
+      assert.match(error.message, /Unable to validate Git project root/);
+      if (result.error) assert.strictEqual(error.cause, result.error);
+      else {
+        assert.strictEqual(error.cause.signal, result.signal);
+        assert.strictEqual(error.cause.status, result.status);
+      }
+      return true;
+    });
+    // Every ancestor is a candidate and the next validation would succeed.
+    assert.strictEqual(mocked.calls(), 1);
+  });
+}
+
+test('explicit project root bypasses Git validation for every interruption result', () => {
+  for (const [, result] of gitValidationFailures) {
+    const mocked = mockGitValidation(result);
+    const projectVault = path.join(os.tmpdir(), 'explicit-memory');
+    const roots = mocked.core.resolveVaultRoots({
+      cwd: os.tmpdir(), env: { ECC_MEMORY_PROJECT_ROOT: projectVault },
+    });
+    assert.strictEqual(roots.project, path.join(projectVault, 'project'));
+    assert.strictEqual(roots.team, path.join(projectVault, 'team'));
+    assert.strictEqual(mocked.calls(), 0);
   }
 });
 
